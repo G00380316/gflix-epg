@@ -1,0 +1,44 @@
+# Builds Gflix EPG every day from EPGSHARE01's all-countries guide and
+# publishes it as the latest release, which is where the app reads it.
+# Lives in G00380316/gflix-epg beside build_gflix_epg.py (a copy of
+# Tools/gflix-epg/build_gflix_epg.py in the Gflix repository).
+name: Build Gflix EPG
+
+on:
+  schedule:
+    # EPGSHARE01 re-rips at about 05:40 (its server's time); this runs after.
+    - cron: "30 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Refuses a stale guide, so a day EPGSHARE01 didn't update publishes
+      # nothing and the app keeps yesterday's.
+      - name: Build
+        run: python3 build_gflix_epg.py --out out
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(date -u +%Y-%m-%d)"
+          gh release delete "$tag" --yes --cleanup-tag || true
+          gh release create "$tag" out/gflix-epg.xml.gz out/gflix-epg-channels.json \
+            --latest --title "Gflix EPG $tag" \
+            --notes "Built from EPGSHARE01 (https://epgshare01.online) on $tag."
+          # A week of releases is plenty to go back to.
+          gh release list --limit 100 --json tagName --jq '.[7:][].tagName' \
+            | xargs -r -I{} gh release delete {} --yes --cleanup-tag
