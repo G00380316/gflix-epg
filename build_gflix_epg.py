@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Build Gflix EPG's two files from one large XMLTV guide.
+"""Build Gflix EPG's files from one large XMLTV guide.
 
-    python3 Tools/gflix-epg/build_gflix_epg.py [guide] [--bundle]
+    python3 Tools/gflix-epg/build_gflix_epg.py [guide] [--bundle] [--previous-source FILE]
 
 The guide is a file, plain XML or gzipped, or a URL to download. With none,
 today's EPGSHARE01 all-countries guide is downloaded -- the source Gflix EPG
@@ -22,14 +22,25 @@ writes, into Tools/gflix-epg/out/ (or --out):
                              Gflix/Resources/GflixEPG/) so channels are matched
                              and their logos shown before any guide is
                              downloaded, and reads this one again once a day.
+  gflix-epg-source.json      what the guide was built from: the source's
+                             entity tag, Last-Modified and SHA-256. The app
+                             never reads it; the next build does.
 
-Upload both to the latest release of G00380316/gflix-epg under those exact
+Upload them to the latest release of G00380316/gflix-epg under those exact
 names; the app asks for
 
   https://github.com/G00380316/gflix-epg/releases/latest/download/gflix-epg.xml.gz
   https://github.com/G00380316/gflix-epg/releases/latest/download/gflix-epg-channels.json
 
 e.g. `gh release create 2026-10-21 out/* --repo G00380316/gflix-epg --latest`.
+
+--previous-source takes the latest release's gflix-epg-source.json. A source
+that hasn't changed since -- its server answers the conditional request with
+"not modified", or it hashes the same -- is not built again: nothing is
+written, and the script says so and succeeds. Nothing new is published then,
+so the app's own conditional request for the guide is answered "not modified"
+too, and a phone downloads it only on a day it really changed. A file that
+isn't there, as before the first release, means there is nothing to compare.
 
 The window is what the app keeps -- a week and a half of replay, a few days
 ahead -- measured from --now (default: now). A guide with less than a quarter
@@ -45,11 +56,13 @@ list.
 import argparse
 import datetime
 import gzip
+import hashlib
 import json
 import os
 import shutil
 import sys
 import time
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape, quoteattr
@@ -59,6 +72,7 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 BUNDLE_DIR = os.path.join(REPO, "Gflix", "Resources", "GflixEPG")
 GUIDE_NAME = "gflix-epg.xml.gz"
 CHANNELS_NAME = "gflix-epg-channels.json"
+SOURCE_RECORD_NAME = "gflix-epg-source.json"
 BUNDLED_CHANNELS_NAME = "GflixEPGChannels.json"
 # Long enough for any synopsis the guide shows; a few guides put whole
 # articles in <desc>.
@@ -102,16 +116,48 @@ def first_icon(element):
 DEFAULT_SOURCE = "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz"
 
 
-def fetch(url, folder):
-    """Downloads `url` into `folder`, a megabyte at a time, and says how far."""
+def read_record(path):
+    """The source record a release was published with, or None: no file,
+    as before the first release, or one this script didn't write."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as file:
+            record = json.load(file)
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) and record.get("version") == 1 else None
+
+
+def fetch(url, folder, previous=None):
+    """Downloads `url` into `folder`, a megabyte at a time, and says how far.
+
+    Returns the file and its record: what the server called it and what it
+    hashes to. Asked conditionally when `previous` is a record of the same
+    URL, and a server that answers "not modified" gets (None, previous).
+    """
     path = os.path.join(folder, "source-" + os.path.basename(url.split("?")[0]))
-    request = urllib.request.Request(url, headers={"User-Agent": "Gflix EPG builder"})
-    with urllib.request.urlopen(request, timeout=60) as response, open(path + ".partial", "wb") as out:
+    headers = {"User-Agent": "Gflix EPG builder"}
+    if previous and previous.get("url") == url:
+        if previous.get("etag"):
+            headers["If-None-Match"] = previous["etag"]
+        if previous.get("lastModified"):
+            headers["If-Modified-Since"] = previous["lastModified"]
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        response = urllib.request.urlopen(request, timeout=60)
+    except urllib.error.HTTPError as error:
+        if error.code == 304 and previous:
+            return None, previous
+        raise
+    digest = hashlib.sha256()
+    with response, open(path + ".partial", "wb") as out:
         total = int(response.headers.get("Content-Length") or 0)
         done = 0
         last = 0.0
         while chunk := response.read(1 << 20):
             out.write(chunk)
+            digest.update(chunk)
             done += len(chunk)
             if time.monotonic() - last > 2:
                 last = time.monotonic()
@@ -119,7 +165,31 @@ def fetch(url, folder):
                 print(f"\rdownloading {done / 1e6:.0f}{share} MB", end="", file=sys.stderr, flush=True)
     os.replace(path + ".partial", path)
     print(file=sys.stderr)
-    return path
+    record = {
+        "version": 1,
+        "url": url,
+        "etag": response.headers.get("ETag"),
+        "lastModified": response.headers.get("Last-Modified"),
+        "sha256": digest.hexdigest(),
+        "bytes": done,
+    }
+    return path, record
+
+
+def file_record(path):
+    """A guide given as a file, recorded as a download is: by what it hashes to."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as file:
+        while chunk := file.read(1 << 20):
+            digest.update(chunk)
+    return {
+        "version": 1,
+        "url": os.path.basename(path),
+        "etag": None,
+        "lastModified": None,
+        "sha256": digest.hexdigest(),
+        "bytes": os.path.getsize(path),
+    }
 
 
 def open_guide(path):
@@ -167,6 +237,11 @@ def main():
         help="write the guide even when most of its programmes fall outside the window",
     )
     parser.add_argument("--bundle", action="store_true", help=f"also copy the channel list into {os.path.relpath(BUNDLE_DIR, REPO)}")
+    parser.add_argument(
+        "--previous-source",
+        help=f"the {SOURCE_RECORD_NAME} of the release last published: a source unchanged since is not built "
+        "again, and nothing is written (a file that isn't there means none)",
+    )
     args = parser.parse_args()
 
     now = (
@@ -176,6 +251,33 @@ def main():
     )
     earliest = now - datetime.timedelta(days=args.past_days)
     latest = now + datetime.timedelta(days=args.future_days)
+
+    # The source first: one unchanged since the last release builds nothing,
+    # so nothing new is published and the app's copy stays current.
+    os.makedirs(args.out, exist_ok=True)
+    previous = read_record(args.previous_source)
+    guide = args.guide
+    downloaded = None
+    if guide.startswith(("http://", "https://")):
+        downloaded, record = fetch(guide, args.out, previous)
+        # None is the server saying it hasn't changed.
+        unchanged = downloaded is None
+        guide = downloaded
+    else:
+        record = file_record(guide)
+        unchanged = False
+    # A server that ignores the conditional request, or offers nothing to
+    # make one with, still sends the same bytes.
+    if previous and previous.get("sha256") and previous.get("sha256") == record.get("sha256"):
+        unchanged = True
+    if unchanged:
+        if downloaded and not args.keep_download:
+            os.remove(downloaded)
+        print(
+            f"The source is unchanged since the release last published (SHA-256 {record.get('sha256')}). "
+            "Nothing was written."
+        )
+        return
 
     # Pass one: channels, and which slots each keeps. Channels come first in
     # XMLTV, but nothing here relies on it.
@@ -201,7 +303,6 @@ def main():
         if entry["icon"] is None:
             entry["icon"] = first_icon(element)
 
-    os.makedirs(args.out, exist_ok=True)
     guide_path = os.path.join(args.out, GUIDE_NAME)
     partial_path = guide_path + ".partial"
     programme_lines = gzip.open(partial_path + ".body", "wt", encoding="utf-8", compresslevel=9)
@@ -251,10 +352,6 @@ def main():
         programme_lines.write("".join(parts))
         written += 1
 
-    guide = args.guide
-    downloaded = None
-    if guide.startswith(("http://", "https://")):
-        downloaded = guide = fetch(guide, args.out)
     try:
         read_guide(guide, add_channel, add_programme)
     finally:
@@ -316,6 +413,11 @@ def main():
     channels_path = os.path.join(args.out, CHANNELS_NAME)
     with open(channels_path, "w", encoding="utf-8") as out:
         json.dump(listing, out, ensure_ascii=False, separators=(",", ":"))
+
+    # Last, so a record is only ever beside a guide it was built into.
+    record_path = os.path.join(args.out, SOURCE_RECORD_NAME)
+    with open(record_path, "w", encoding="utf-8") as out:
+        json.dump(record, out, indent=1)
 
     if args.bundle:
         os.makedirs(BUNDLE_DIR, exist_ok=True)

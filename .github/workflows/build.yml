@@ -9,6 +9,11 @@ on:
     # EPGSHARE01 re-rips at about 05:40 (its server's time); this runs after.
     - cron: "30 8 * * *"
   workflow_dispatch:
+    inputs:
+      rebuild:
+        description: Build and publish even if the source hasn't changed since the latest release
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -26,17 +31,28 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      # Refuses a stale guide, so a day EPGSHARE01 didn't update publishes
-      # nothing and the app keeps yesterday's.
+      # What the latest release was built from. None before the first
+      # release that has one, or when asked to rebuild, and then it builds.
+      - name: Previous source
+        if: ${{ !inputs.rebuild }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download --pattern gflix-epg-source.json --dir previous || true
+      # Writes nothing for a source unchanged since the latest release, and
+      # refuses a stale one. Either way nothing is published, the latest
+      # release stays as it was, and the app's conditional request for the
+      # guide is answered "not modified": a phone downloads it only on a day
+      # it really changed.
       - name: Build
-        run: python3 build_gflix_epg.py --out out
+        run: python3 build_gflix_epg.py --out out --previous-source previous/gflix-epg-source.json
       - name: Publish
+        if: ${{ hashFiles('out/gflix-epg.xml.gz') != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="$(date -u +%Y-%m-%d)"
           gh release delete "$tag" --yes --cleanup-tag || true
-          gh release create "$tag" out/gflix-epg.xml.gz out/gflix-epg-channels.json \
+          gh release create "$tag" out/gflix-epg.xml.gz out/gflix-epg-channels.json out/gflix-epg-source.json \
             --latest --title "Gflix EPG $tag" \
             --notes "Built from EPGSHARE01 (https://epgshare01.online) on $tag."
           # A week of releases is plenty to go back to.
